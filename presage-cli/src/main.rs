@@ -131,6 +131,11 @@ enum Cmd {
     ListGroups,
     #[clap(about = "List contacts")]
     ListContacts,
+    #[clap(about = "List threads")]
+    ListThreads {
+        #[clap(long = "sorted", short = 's')]
+        sorted: bool,
+    },
     #[clap(
         about = "List messages",
         group(
@@ -739,6 +744,110 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             let mut manager = Manager::load_registered(config_store).await?;
             manager.sync_contacts().await?;
         }
+        Cmd::ListThreads { sorted } => {
+            let manager = Manager::load_registered(config_store).await?;
+
+            let contacts = manager
+                .store()
+                .contacts()?
+                .filter_map(Result::ok)
+                .map(|c| Thread::Contact(c.uuid))
+                .filter(|t| {
+                    manager
+                        .messages(&t, 0..)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|m| match m.body {
+                            ContentBody::SynchronizeMessage(_) => false,
+                            _ => true,
+                        })
+                        .count()
+                        > 0
+                });
+            let groups = manager
+                .store()
+                .groups()?
+                .filter_map(Result::ok)
+                .map(|c| Thread::Group(c.0))
+                .filter(|t| {
+                    manager
+                        .messages(&t, 0..)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|m| match m.body {
+                            ContentBody::SynchronizeMessage(_) => false,
+                            _ => true,
+                        })
+                        .count()
+                        > 0
+                });
+
+            let mut threads: Vec<Thread> = contacts.chain(groups).collect();
+
+            if sorted {
+                threads.sort_by(|a, b| {
+                    let t1 = manager
+                        .messages(&a, 0..)
+                        .unwrap()
+                        .filter(|m| match m.as_ref().unwrap().body {
+                            ContentBody::SynchronizeMessage(_) => false,
+                            _ => true,
+                        })
+                        .map(|m| m.unwrap().metadata.timestamp)
+                        .last()
+                        .unwrap_or(0);
+                    let t2 = manager
+                        .messages(&b, 0..)
+                        .unwrap()
+                        .filter(|m| match m.as_ref().unwrap().body {
+                            ContentBody::SynchronizeMessage(_) => false,
+                            _ => true,
+                        })
+                        .map(|m| m.unwrap().metadata.timestamp)
+                        .last()
+                        .unwrap_or(0);
+                    t1.partial_cmp(&t2).unwrap()
+                });
+                threads.reverse();
+            }
+
+            for t in threads {
+                // let timestamp = manager.messages(&t, 0..)?.map(|m| m.unwrap().metadata.timestamp).last()
+                //     .unwrap_or(0);
+                match t {
+                    Thread::Contact(uuid) => {
+                        let contact = manager
+                            .store()
+                            .contacts()?
+                            .filter_map(Result::ok)
+                            .find(|c| c.uuid == uuid)
+                            .unwrap();
+                        println!(
+                            "Contact {uuid} / {:?} / {}",
+                            contact.phone_number, contact.name
+                        );
+                    }
+                    Thread::Group(master_key) => {
+                        let g = manager
+                            .store()
+                            .groups()?
+                            .find(|g| g.as_ref().unwrap().0 == master_key)
+                            .unwrap()
+                            .unwrap()
+                            .1;
+                        let key = hex::encode(master_key);
+                        println!(
+                            "Group {key} / {} / {:?} / revision {} / {} members",
+                            g.title,
+                            g.description,
+                            g.revision,
+                            g.members.len()
+                        );
+                    }
+                };
+            }
+        }
+
         Cmd::ListMessages {
             group_master_key,
             recipient_uuid,
