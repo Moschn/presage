@@ -375,7 +375,7 @@ fn print_message<S: Store>(
             .flatten()
             .filter(|c| !c.name.is_empty())
             .map(|c| format!("{}: {}", c.name, uuid))
-            .unwrap_or_else(|| uuid.to_string())
+            .unwrap_or_else(|| format!("Unknown: {}", uuid.to_string()))
     };
 
     let format_group = |key| {
