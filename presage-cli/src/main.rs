@@ -135,6 +135,8 @@ enum Cmd {
     ListThreads {
         #[clap(long = "sorted", short = 's')]
         sorted: bool,
+        #[clap(long = "filter-empty", short = 'f')]
+        filter_empty: bool,
     },
     #[clap(
         about = "List messages",
@@ -744,7 +746,10 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             let mut manager = Manager::load_registered(config_store).await?;
             manager.sync_contacts().await?;
         }
-        Cmd::ListThreads { sorted } => {
+        Cmd::ListThreads {
+            filter_empty,
+            sorted,
+        } => {
             let manager = Manager::load_registered(config_store).await?;
 
             let contacts = manager
@@ -763,6 +768,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                         })
                         .count()
                         > 0
+                        || !filter_empty
                 });
             let groups = manager
                 .store()
@@ -780,6 +786,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                         })
                         .count()
                         > 0
+                        || !filter_empty
                 });
 
             let mut threads: Vec<Thread> = contacts.chain(groups).collect();
