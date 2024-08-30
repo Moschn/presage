@@ -481,7 +481,7 @@ async fn receive<S: Store>(
     );
 
     let messages = manager
-        .receive_messages(ReceivingMode::Forever)
+        .receive_messages(ReceivingMode::InitialSync)
         .await
         .context("failed to initialize messages stream")?;
     pin_mut!(messages);
@@ -796,21 +796,23 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                     let t1 = manager
                         .messages(&a, 0..)
                         .unwrap()
-                        .filter(|m| match m.as_ref().unwrap().body {
+                        .filter_map(Result::ok)
+                        .filter(|m| match m.body {
                             ContentBody::SynchronizeMessage(_) => false,
                             _ => true,
                         })
-                        .map(|m| m.unwrap().metadata.timestamp)
+                        .map(|m| m.metadata.timestamp)
                         .last()
                         .unwrap_or(0);
                     let t2 = manager
                         .messages(&b, 0..)
                         .unwrap()
-                        .filter(|m| match m.as_ref().unwrap().body {
+                        .filter_map(Result::ok)
+                        .filter(|m| match m.body {
                             ContentBody::SynchronizeMessage(_) => false,
                             _ => true,
                         })
-                        .map(|m| m.unwrap().metadata.timestamp)
+                        .map(|m| m.metadata.timestamp)
                         .last()
                         .unwrap_or(0);
                     t1.partial_cmp(&t2).unwrap()
