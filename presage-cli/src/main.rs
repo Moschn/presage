@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context as _};
@@ -11,21 +12,26 @@ use directories::ProjectDirs;
 use env_logger::Env;
 use futures::StreamExt;
 use futures::{channel::oneshot, future, pin_mut};
-use log::{debug, error, info};
+use mime_guess::mime::APPLICATION_OCTET_STREAM;
 use notify_rust::Notification;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Reaction;
-use presage::libsignal_service::models::Contact;
 use presage::libsignal_service::pre_keys::PreKeysStore;
 use presage::libsignal_service::prelude::phonenumber::PhoneNumber;
+use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::proto::data_message::Quote;
 use presage::libsignal_service::proto::sync_message::Sent;
+use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::sender::AttachmentSpec;
 use presage::libsignal_service::zkgroup::GroupMasterKeyBytes;
-use presage::libsignal_service::ServiceAddress;
-use presage::libsignal_service::{groups_v2::Group, prelude::ProfileKey};
-use presage::manager::ReceivingMode;
+use presage::model::contacts::Contact;
+use presage::model::groups::Group;
+use presage::model::identity::OnNewIdentity;
+use presage::model::messages::Received;
+use presage::proto::receipt_message;
 use presage::proto::EditMessage;
+use presage::proto::ReceiptMessage;
 use presage::proto::SyncMessage;
 use presage::store::ContentExt;
 use presage::{
@@ -35,14 +41,15 @@ use presage::{
     Manager,
 };
 use presage_store_sled::MigrationConflictStrategy;
-use presage_store_sled::OnNewIdentity;
 use presage_store_sled::SledStore;
 use tempfile::Builder;
-use tokio::task;
+use tempfile::TempDir;
 use tokio::{
     fs,
     io::{self, AsyncBufReadExt, BufReader},
 };
+use tracing::warn;
+use tracing::{debug, error, info};
 use url::Url;
 
 #[derive(Parser)]
@@ -180,6 +187,8 @@ enum Cmd {
         uuid: Uuid,
         #[clap(long, short = 'm', help = "Contents of the message to send")]
         message: String,
+        #[clap(long = "attach", help = "Path to a file to attach, can be repeated")]
+        attachment_filepath: Vec<PathBuf>,
     },
     #[clap(about = "Send a message to group")]
     SendToGroup {
@@ -187,8 +196,10 @@ enum Cmd {
         message: String,
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
         master_key: GroupMasterKeyBytes,
+        #[clap(long = "attach", help = "Path to a file to attach, can be repeated")]
+        attachment_filepath: Vec<PathBuf>,
     },
-    RequestContactsSync,
+    SyncContacts,
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
 }
@@ -205,9 +216,18 @@ fn parse_group_master_key(value: &str) -> anyhow::Result<GroupMasterKeyBytes> {
         .map_err(|_| anyhow::format_err!("master key should be 32 bytes long"))
 }
 
+fn attachments_tmp_dir() -> anyhow::Result<TempDir> {
+    let attachments_tmp_dir = Builder::new().prefix("presage-attachments").tempdir()?;
+    info!(
+        path =% attachments_tmp_dir.path().display(),
+        "attachments will be stored"
+    );
+    Ok(attachments_tmp_dir)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    env_logger::from_env(
+    env_logger::Builder::from_env(
         Env::default().default_filter_or(format!("{}=warn", env!("CARGO_PKG_NAME"))),
     )
     .init();
@@ -220,13 +240,14 @@ async fn main() -> anyhow::Result<()> {
             .config_dir()
             .into()
     });
-    debug!("opening config database from {}", db_path.display());
+    debug!(db_path =% db_path.display(), "opening config database");
     let config_store = SledStore::open_with_passphrase(
         db_path,
         args.passphrase,
         MigrationConflictStrategy::Raise,
         OnNewIdentity::Trust,
-    )?;
+    )
+    .await?;
     run(args.subcommand, config_store).await
 }
 
@@ -235,7 +256,7 @@ async fn send<S: Store>(
     recipient: Recipient,
     msg: impl Into<ContentBody>,
 ) -> anyhow::Result<()> {
-    let local = task::LocalSet::new();
+    let attachments_tmp_dir = attachments_tmp_dir()?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -247,33 +268,52 @@ async fn send<S: Store>(
         d.timestamp = Some(timestamp);
     }
 
-    local
-        .run_until(async move {
-            let mut receiving_manager = manager.clone();
-            task::spawn_local(async move {
-                if let Err(e) = receive(&mut receiving_manager, false).await {
-                    error!("error while receiving stuff: {e}");
-                }
-            });
+    let messages = manager
+        .receive_messages()
+        .await
+        .context("failed to initialize messages stream")?;
+    pin_mut!(messages);
 
-            match recipient {
-                Recipient::Contact(uuid) => {
-                    info!("sending message to contact");
-                    manager
-                        .send_message(ServiceAddress::new_aci(uuid), content_body, timestamp)
-                        .await
-                        .expect("failed to send message");
-                }
-                Recipient::Group(master_key) => {
-                    info!("sending message to group");
-                    manager
-                        .send_message_to_group(&master_key, content_body, timestamp)
-                        .await
-                        .expect("failed to send message");
-                }
+    println!("synchronizing messages since last time");
+
+    while let Some(content) = messages.next().await {
+        match content {
+            Received::QueueEmpty => break,
+            Received::Contacts => continue,
+            Received::Content(content) => {
+                process_incoming_message(manager, attachments_tmp_dir.path(), false, &content).await
             }
-        })
-        .await;
+        }
+    }
+
+    println!("done synchronizing, sending your message now!");
+
+    match recipient {
+        Recipient::Contact(uuid) => {
+            info!(recipient =% uuid, "sending message to contact");
+            manager
+                .send_message(ServiceId::Aci(uuid.into()), content_body, timestamp)
+                .await
+                .expect("failed to send message");
+        }
+        Recipient::Group(master_key) => {
+            info!("sending message to group");
+            manager
+                .send_message_to_group(&master_key, content_body, timestamp)
+                .await
+                .expect("failed to send message");
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(60), async move {
+        while let Some(msg) = messages.next().await {
+            if let Received::Contacts = msg {
+                println!("got contacts sync!");
+                break;
+            }
+        }
+    })
+    .await?;
 
     Ok(())
 }
@@ -286,13 +326,13 @@ async fn process_incoming_message<S: Store>(
     notifications: bool,
     content: &Content,
 ) {
-    print_message(manager, notifications, content);
+    print_message(manager, notifications, content).await;
 
-    let sender = content.metadata.sender.uuid;
+    let sender = content.metadata.sender.raw_uuid();
     if let ContentBody::DataMessage(DataMessage { attachments, .. }) = &content.body {
         for attachment_pointer in attachments {
             let Ok(attachment_data) = manager.get_attachment(attachment_pointer).await else {
-                log::warn!("failed to fetch attachment");
+                warn!("failed to fetch attachment");
                 continue;
             };
 
@@ -309,86 +349,96 @@ async fn process_incoming_message<S: Store>(
                 .unwrap_or_else(|| Local::now().format("%Y-%m-%d-%H-%M-%s").to_string());
             let file_path = attachments_tmp_dir.join(format!("presage-{filename}.{extension}",));
             match fs::write(&file_path, &attachment_data).await {
-                Ok(_) => info!("saved attachment from {sender} to {}", file_path.display()),
+                Ok(_) => info!(%sender, file_path =% file_path.display(), "saved attachment"),
                 Err(error) => error!(
-                    "failed to write attachment from {sender} to {}: {error}",
-                    file_path.display()
+                    %sender,
+                    file_path =% file_path.display(),
+                    %error,
+                    "failed to write attachment"
                 ),
             }
         }
     }
 }
 
-fn print_message<S: Store>(
+async fn print_message<S: Store>(
     manager: &Manager<S, Registered>,
     notifications: bool,
     content: &Content,
 ) {
     let Ok(thread) = Thread::try_from(content) else {
-        log::warn!("failed to derive thread from content");
+        warn!("failed to derive thread from content");
         return;
     };
 
-    let format_data_message = |thread: &Thread, data_message: &DataMessage| match data_message {
-        DataMessage {
-            quote:
-                Some(Quote {
-                    text: Some(quoted_text),
-                    ..
-                }),
-            body: Some(body),
-            ..
-        } => Some(format!("Answer to message \"{quoted_text}\": {body}")),
-        DataMessage {
-            reaction:
-                Some(Reaction {
-                    target_sent_timestamp: Some(timestamp),
-                    emoji: Some(emoji),
-                    ..
-                }),
-            ..
-        } => {
-            let Ok(Some(message)) = manager.store().message(thread, *timestamp) else {
-                log::warn!("no message in {thread} sent at {timestamp}");
-                return None;
-            };
+    async fn format_data_message<S: Store>(
+        thread: &Thread,
+        data_message: &DataMessage,
+        manager: &Manager<S, Registered>,
+    ) -> Option<String> {
+        match data_message {
+            DataMessage {
+                quote:
+                    Some(Quote {
+                        text: Some(quoted_text),
+                        ..
+                    }),
+                body: Some(body),
+                ..
+            } => Some(format!("Answer to message \"{quoted_text}\": {body}")),
+            DataMessage {
+                reaction:
+                    Some(Reaction {
+                        target_sent_timestamp: Some(ts),
+                        emoji: Some(emoji),
+                        ..
+                    }),
+                ..
+            } => {
+                let Ok(Some(message)) = manager.store().message(thread, *ts).await else {
+                    warn!(%thread, sent_at = ts, "no message found in thread");
+                    return None;
+                };
 
-            let ContentBody::DataMessage(DataMessage {
+                let ContentBody::DataMessage(DataMessage {
+                    body: Some(body), ..
+                }) = message.body
+                else {
+                    warn!("message reacted to has no body");
+                    return None;
+                };
+
+                Some(format!("Reacted with {emoji} to message: \"{body}\""))
+            }
+            DataMessage {
                 body: Some(body), ..
-            }) = message.body
-            else {
-                log::warn!("message reacted to has no body");
-                return None;
-            };
-
-            Some(format!("Reacted with {emoji} to message: \"{body}\""))
+            } => Some(body.to_string()),
+            _ => Some("Empty data message".to_string()),
         }
-        DataMessage {
-            body: Some(body), ..
-        } => Some(body.to_string()),
-        _ => Some("Empty data message".to_string()),
-    };
+    }
 
-    let format_contact = |uuid| {
+    async fn format_contact<S: Store>(uuid: &Uuid, manager: &Manager<S, Registered>) -> String {
         manager
             .store()
             .contact_by_id(uuid)
+            .await
             .ok()
             .flatten()
             .filter(|c| !c.name.is_empty())
             .map(|c| format!("{}: {}", c.name, uuid))
-            .unwrap_or_else(|| format!("Unknown: {}", uuid.to_string()))
-    };
+            .unwrap_or_else(|| uuid.to_string())
+    }
 
-    let format_group = |key| {
+    async fn format_group<S: Store>(key: [u8; 32], manager: &Manager<S, Registered>) -> String {
         manager
             .store()
             .group(key)
+            .await
             .ok()
             .flatten()
             .map(|g| g.title)
             .unwrap_or_else(|| "<missing group>".to_string())
-    };
+    }
 
     enum Msg<'a> {
         Received(&'a Thread, String),
@@ -401,12 +451,17 @@ fn print_message<S: Store>(
             "Null message (for example deleted)".to_string(),
         )),
         ContentBody::DataMessage(data_message) => {
-            format_data_message(&thread, data_message).map(|body| Msg::Received(&thread, body))
+            format_data_message(&thread, data_message, manager)
+                .await
+                .map(|body| Msg::Received(&thread, body))
         }
         ContentBody::EditMessage(EditMessage {
             data_message: Some(data_message),
             ..
-        }) => format_data_message(&thread, data_message).map(|body| Msg::Received(&thread, body)),
+        }) => format_data_message(&thread, data_message, manager)
+            .await
+            .map(|body| Msg::Received(&thread, body)),
+        ContentBody::EditMessage(EditMessage { .. }) => None,
         ContentBody::SynchronizeMessage(SyncMessage {
             sent:
                 Some(Sent {
@@ -414,7 +469,9 @@ fn print_message<S: Store>(
                     ..
                 }),
             ..
-        }) => format_data_message(&thread, data_message).map(|body| Msg::Sent(&thread, body)),
+        }) => format_data_message(&thread, data_message, manager)
+            .await
+            .map(|body| Msg::Sent(&thread, body)),
         ContentBody::SynchronizeMessage(SyncMessage {
             sent:
                 Some(Sent {
@@ -426,31 +483,46 @@ fn print_message<S: Store>(
                     ..
                 }),
             ..
-        }) => format_data_message(&thread, data_message).map(|body| Msg::Sent(&thread, body)),
+        }) => format_data_message(&thread, data_message, manager)
+            .await
+            .map(|body| Msg::Sent(&thread, body)),
+        ContentBody::SynchronizeMessage(SyncMessage { .. }) => None,
         ContentBody::CallMessage(_) => Some(Msg::Received(&thread, "is calling!".into())),
         ContentBody::TypingMessage(_) => Some(Msg::Received(&thread, "is typing...".into())),
-        c => {
-            log::warn!("unsupported message {c:?}");
-            None
+        ContentBody::ReceiptMessage(ReceiptMessage {
+            r#type: receipt_type,
+            timestamp,
+        }) => Some(Msg::Received(
+            &thread,
+            format!(
+                "got {:?} receipt for messages sent at {timestamp:?}",
+                receipt_message::Type::try_from(receipt_type.unwrap_or_default()).unwrap()
+            ),
+        )),
+        ContentBody::StoryMessage(story) => {
+            Some(Msg::Received(&thread, format!("new story: {story:?}")))
+        }
+        ContentBody::PniSignatureMessage(_) => {
+            Some(Msg::Received(&thread, "got PNI signature message".into()))
         }
     } {
         let ts = content.timestamp();
         let (prefix, body) = match msg {
             Msg::Received(Thread::Contact(sender), body) => {
-                let contact = format_contact(sender);
+                let contact = format_contact(sender, manager).await;
                 (format!("From {contact} @ {ts}: "), body)
             }
             Msg::Sent(Thread::Contact(recipient), body) => {
-                let contact = format_contact(recipient);
+                let contact = format_contact(recipient, manager).await;
                 (format!("To {contact} @ {ts}"), body)
             }
             Msg::Received(Thread::Group(key), body) => {
-                let sender = format_contact(&content.metadata.sender.uuid);
-                let group = format_group(*key);
+                let sender = format_contact(&content.metadata.sender.raw_uuid(), manager).await;
+                let group = format_group(*key, manager).await;
                 (format!("From {sender} to group {group} @ {ts}: "), body)
             }
             Msg::Sent(Thread::Group(key), body) => {
-                let group = format_group(*key);
+                let group = format_group(*key, manager).await;
                 (format!("To group {group} @ {ts}"), body)
             }
         };
@@ -458,13 +530,13 @@ fn print_message<S: Store>(
         println!("{prefix} / {body}");
 
         if notifications {
-            if let Err(e) = Notification::new()
+            if let Err(error) = Notification::new()
                 .summary(&prefix)
                 .body(&body)
                 .icon("presage")
                 .show()
             {
-                log::error!("failed to display desktop notification: {e}");
+                error!(%error, "failed to display desktop notification");
             }
         }
     }
@@ -474,21 +546,27 @@ async fn receive<S: Store>(
     manager: &mut Manager<S, Registered>,
     notifications: bool,
 ) -> anyhow::Result<()> {
-    let attachments_tmp_dir = Builder::new().prefix("presage-attachments").tempdir()?;
-    info!(
-        "attachments will be stored in {}",
-        attachments_tmp_dir.path().display()
-    );
-
+    let attachments_tmp_dir = attachments_tmp_dir()?;
     let messages = manager
-        .receive_messages(ReceivingMode::InitialSync)
+        .receive_messages()
         .await
         .context("failed to initialize messages stream")?;
     pin_mut!(messages);
 
     while let Some(content) = messages.next().await {
-        process_incoming_message(manager, attachments_tmp_dir.path(), notifications, &content)
-            .await;
+        match content {
+            Received::QueueEmpty => println!("done with synchronization"),
+            Received::Contacts => println!("got contacts synchronization"),
+            Received::Content(content) => {
+                process_incoming_message(
+                    manager,
+                    attachments_tmp_dir.path(),
+                    notifications,
+                    &content,
+                )
+                .await
+            }
+        }
     }
 
     Ok(())
@@ -523,8 +601,8 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                 let registered_manager =
                     manager.confirm_verification_code(confirmation_code).await?;
                 println!(
-                    "Account identifier: {}",
-                    registered_manager.registration_data().aci()
+                    "Account identifiers: {}",
+                    registered_manager.registration_data().service_ids
                 );
             }
         }
@@ -547,7 +625,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                             qr2term::print_qr(url.to_string()).expect("failed to render qrcode");
                             println!("Alternatively, use the URL: {}", url);
                         }
-                        Err(e) => log::error!("Error linking device: {e}"),
+                        Err(error) => error!(%error, "linking device was cancelled"),
                     }
                 },
             )
@@ -555,8 +633,8 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
 
             match manager {
                 (Ok(manager), _) => {
-                    let uuid = manager.whoami().await.unwrap().uuid;
-                    println!("{uuid:?}");
+                    let whoami = manager.whoami().await.unwrap();
+                    println!("{whoami:?}");
                 }
                 (Err(err), _) => {
                     println!("{err:?}");
@@ -564,7 +642,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             }
         }
         Cmd::AddDevice { url } => {
-            let manager = Manager::load_registered(config_store).await?;
+            let mut manager = Manager::load_registered(config_store).await?;
             manager.link_secondary(url).await?;
             println!("Added new secondary device");
         }
@@ -598,11 +676,16 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             let mut manager = Manager::load_registered(config_store).await?;
             receive(&mut manager, notifications).await?;
         }
-        Cmd::Send { uuid, message } => {
+        Cmd::Send {
+            uuid,
+            message,
+            attachment_filepath,
+        } => {
             let mut manager = Manager::load_registered(config_store).await?;
-
+            let attachments = upload_attachments(attachment_filepath, &manager).await?;
             let data_message = DataMessage {
                 body: Some(message),
+                attachments,
                 ..Default::default()
             };
 
@@ -611,11 +694,13 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
         Cmd::SendToGroup {
             message,
             master_key,
+            attachment_filepath,
         } => {
             let mut manager = Manager::load_registered(config_store).await?;
-
+            let attachments = upload_attachments(attachment_filepath, &manager).await?;
             let data_message = DataMessage {
                 body: Some(message),
+                attachments,
                 group_v2: Some(GroupContextV2 {
                     master_key: Some(master_key.to_vec()),
                     revision: Some(0),
@@ -634,7 +719,8 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             if profile_key.is_none() {
                 for contact in manager
                     .store()
-                    .contacts()?
+                    .contacts()
+                    .await?
                     .filter_map(Result::ok)
                     .filter(|c| c.uuid == uuid)
                 {
@@ -655,7 +741,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
         }
         Cmd::ListGroups => {
             let manager = Manager::load_registered(config_store).await?;
-            for group in manager.store().groups()? {
+            for group in manager.store().groups().await? {
                 match group {
                     Ok((
                         group_master_key,
@@ -674,7 +760,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                         );
                     }
                     Err(error) => {
-                        error!("Error: failed to deserialize group, {error}");
+                        error!(%error, "failed to deserialize group");
                     }
                 };
             }
@@ -686,14 +772,14 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                 uuid,
                 phone_number,
                 ..
-            } in manager.store().contacts()?.flatten()
+            } in manager.store().contacts().await?.flatten()
             {
                 println!("{uuid} / {phone_number:?} / {name}");
             }
         }
         Cmd::ListStickerPacks => {
             let manager = Manager::load_registered(config_store).await?;
-            for sticker_pack in manager.sticker_packs().await? {
+            for sticker_pack in manager.store().sticker_packs().await? {
                 match sticker_pack {
                     Ok(sticker_pack) => {
                         println!(
@@ -710,7 +796,9 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                             )
                         }
                     }
-                    Err(error) => error!("error while deserializing sticker pack: {error}"),
+                    Err(error) => {
+                        error!(%error, "error while deserializing sticker pack")
+                    }
                 }
             }
         }
@@ -720,7 +808,7 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
         }
         Cmd::GetContact { ref uuid } => {
             let manager = Manager::load_registered(config_store).await?;
-            match manager.store().contact_by_id(uuid)? {
+            match manager.store().contact_by_id(uuid).await? {
                 Some(contact) => println!("{contact:#?}"),
                 None => eprintln!("Could not find contact for {uuid}"),
             }
@@ -733,7 +821,8 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             let manager = Manager::load_registered(config_store).await?;
             for contact in manager
                 .store()
-                .contacts()?
+                .contacts()
+                .await?
                 .filter_map(Result::ok)
                 .filter(|c| uuid.map_or_else(|| true, |u| c.uuid == u))
                 .filter(|c| c.phone_number == phone_number)
@@ -742,9 +831,25 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                 println!("{contact:#?}");
             }
         }
-        Cmd::RequestContactsSync => {
+        Cmd::SyncContacts => {
             let mut manager = Manager::load_registered(config_store).await?;
-            manager.sync_contacts().await?;
+            manager.request_contacts().await?;
+
+            let messages = manager
+                .receive_messages()
+                .await
+                .context("failed to initialize messages stream")?;
+            pin_mut!(messages);
+
+            println!("synchronizing messages until we get contacts (dots are messages synced from the past timeline)");
+
+            while let Some(content) = messages.next().await {
+                match content {
+                    Received::QueueEmpty => break,
+                    Received::Contacts => println!("got contacts! thank you, come again."),
+                    Received::Content(_) => print!("."),
+                }
+            }
         }
         Cmd::ListThreads {
             filter_empty,
@@ -869,10 +974,12 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                 _ => unreachable!(),
             };
             for msg in manager
-                .messages(&thread, from.unwrap_or(0)..)?
+                .store()
+                .messages(&thread, from.unwrap_or(0)..)
+                .await?
                 .filter_map(Result::ok)
             {
-                print_message(&manager, false, &msg);
+                print_message(&manager, false, &msg).await;
             }
         }
         Cmd::Stats => {
@@ -925,6 +1032,45 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn upload_attachments<S: Store>(
+    attachment_filepath: Vec<PathBuf>,
+    manager: &Manager<S, Registered>,
+) -> Result<Vec<presage::proto::AttachmentPointer>, anyhow::Error> {
+    let attachment_specs: Vec<_> = attachment_filepath
+        .into_iter()
+        .filter_map(|path| {
+            let data = std::fs::read(&path).ok()?;
+            Some((
+                AttachmentSpec {
+                    content_type: mime_guess::from_path(&path)
+                        .first()
+                        .unwrap_or(APPLICATION_OCTET_STREAM)
+                        .to_string(),
+                    length: data.len(),
+                    file_name: path.file_name().map(|s| s.to_string_lossy().to_string()),
+                    preview: None,
+                    voice_note: None,
+                    borderless: None,
+                    width: None,
+                    height: None,
+                    caption: None,
+                    blur_hash: None,
+                },
+                data,
+            ))
+        })
+        .collect();
+
+    let attachments: Result<Vec<_>, _> = manager
+        .upload_attachments(attachment_specs)
+        .await?
+        .into_iter()
+        .collect();
+
+    let attachments = attachments?;
+    Ok(attachments)
 }
 
 fn parse_base64_profile_key(s: &str) -> anyhow::Result<ProfileKey> {
