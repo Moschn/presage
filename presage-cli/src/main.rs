@@ -859,67 +859,47 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
 
             let contacts = manager
                 .store()
-                .contacts()?
+                .contacts()
+                .await?
                 .filter_map(Result::ok)
-                .map(|c| Thread::Contact(c.uuid))
-                .filter(|t| {
-                    manager
-                        .messages(&t, 0..)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter(|m| match m.body {
-                            ContentBody::SynchronizeMessage(_) => false,
-                            _ => true,
-                        })
-                        .count()
-                        > 0
-                        || !filter_empty
-                });
+                .map(|c| Thread::Contact(c.uuid));
+
             let groups = manager
                 .store()
-                .groups()?
+                .groups()
+                .await?
                 .filter_map(Result::ok)
-                .map(|c| Thread::Group(c.0))
-                .filter(|t| {
-                    manager
-                        .messages(&t, 0..)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter(|m| match m.body {
-                            ContentBody::SynchronizeMessage(_) => false,
-                            _ => true,
-                        })
-                        .count()
-                        > 0
-                        || !filter_empty
-                });
+                .map(|c| Thread::Group(c.0));
 
-            let mut threads: Vec<Thread> = contacts.chain(groups).collect();
+            let mut threads: Vec<(Thread, u64)> = Vec::new();
+
+            for t in contacts.chain(groups) {
+                let msgs: Vec<Content> = manager
+                    .store()
+                    .messages(&t, 0..)
+                    .await?
+                    .filter_map(Result::ok)
+                    .filter(|m| match m.body {
+                        ContentBody::SynchronizeMessage(_) => false,
+                        _ => true,
+                    })
+                    .collect();
+
+                let count = msgs.len();
+                let last = msgs
+                    .into_iter()
+                    .map(|m| m.metadata.timestamp)
+                    .last()
+                    .unwrap_or(0);
+                if count > 0 || !filter_empty {
+                    threads.push((t, last));
+                }
+            }
 
             if sorted {
                 threads.sort_by(|a, b| {
-                    let t1 = manager
-                        .messages(&a, 0..)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter(|m| match m.body {
-                            ContentBody::SynchronizeMessage(_) => false,
-                            _ => true,
-                        })
-                        .map(|m| m.metadata.timestamp)
-                        .last()
-                        .unwrap_or(0);
-                    let t2 = manager
-                        .messages(&b, 0..)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter(|m| match m.body {
-                            ContentBody::SynchronizeMessage(_) => false,
-                            _ => true,
-                        })
-                        .map(|m| m.metadata.timestamp)
-                        .last()
-                        .unwrap_or(0);
+                    let t1 = a.1;
+                    let t2 = b.1;
                     t1.partial_cmp(&t2).unwrap()
                 });
                 threads.reverse();
@@ -928,11 +908,12 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
             for t in threads {
                 // let timestamp = manager.messages(&t, 0..)?.map(|m| m.unwrap().metadata.timestamp).last()
                 //     .unwrap_or(0);
-                match t {
+                match t.0 {
                     Thread::Contact(uuid) => {
                         let contact = manager
                             .store()
-                            .contacts()?
+                            .contacts()
+                            .await?
                             .filter_map(Result::ok)
                             .find(|c| c.uuid == uuid)
                             .unwrap();
@@ -944,7 +925,8 @@ async fn run<S: Store>(subcommand: Cmd, config_store: S) -> anyhow::Result<()> {
                     Thread::Group(master_key) => {
                         let g = manager
                             .store()
-                            .groups()?
+                            .groups()
+                            .await?
                             .find(|g| g.as_ref().unwrap().0 == master_key)
                             .unwrap()
                             .unwrap()
