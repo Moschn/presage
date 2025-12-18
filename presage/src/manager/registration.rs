@@ -1,8 +1,9 @@
+use std::sync::Arc;
+
 use libsignal_service::configuration::{ServiceConfiguration, SignalServers};
 use libsignal_service::prelude::phonenumber::PhoneNumber;
 use libsignal_service::push_service::{PushService, VerificationTransport};
-use rand::distributions::{Alphanumeric, DistString};
-use rand::thread_rng;
+use rand::distr::{Alphanumeric, SampleString};
 use tracing::trace;
 
 use crate::store::Store;
@@ -39,12 +40,11 @@ impl<S: Store> Manager<S, Registration> {
     /// use presage::Manager;
     /// use presage::model::identity::OnNewIdentity;
     ///
-    /// use presage_store_sled::{MigrationConflictStrategy, SledStore};
+    /// use presage_store_sqlite::SqliteStore;
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let store =
-    ///         SledStore::open("/tmp/presage-example", MigrationConflictStrategy::Drop, OnNewIdentity::Trust).await?;
+    ///     let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
     ///
     ///     let manager = Manager::register(
     ///         store,
@@ -81,7 +81,7 @@ impl<S: Store> Manager<S, Registration> {
         store.clear_registration().await?;
 
         // generate a random alphanumeric 24 chars password
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let password = Alphanumeric.sample_string(&mut rng, 24);
 
         let service_configuration: ServiceConfiguration = signal_servers.into();
@@ -129,12 +129,12 @@ impl<S: Store> Manager<S, Registration> {
 
         let manager = Manager {
             store,
-            state: Confirmation {
+            state: Arc::new(Confirmation {
                 signal_servers,
                 phone_number,
                 password,
                 session_id: session.id,
-            },
+            }),
         };
 
         Ok(manager)

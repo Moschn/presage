@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use futures::channel::{mpsc, oneshot};
 use futures::{future, StreamExt};
 use libsignal_service::configuration::{ServiceConfiguration, SignalServers};
@@ -6,8 +8,10 @@ use libsignal_service::protocol::IdentityKeyPair;
 use libsignal_service::provisioning::{
     link_device, NewDeviceRegistration, SecondaryDeviceProvisioning,
 };
-use rand::distributions::{Alphanumeric, DistString};
-use rand::{thread_rng, RngCore};
+use rand::{
+    distr::{Alphanumeric, SampleString},
+    rng, RngCore,
+};
 use tracing::info;
 use url::Url;
 
@@ -29,12 +33,11 @@ impl<S: Store> Manager<S, Linking> {
     /// use presage::libsignal_service::configuration::SignalServers;
     /// use presage::Manager;
     /// use presage::model::identity::OnNewIdentity;
-    /// use presage_store_sled::{MigrationConflictStrategy, SledStore};
+    /// use presage_store_sqlite::SqliteStore;
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let store =
-    ///         SledStore::open("/tmp/presage-example", MigrationConflictStrategy::Drop, OnNewIdentity::Trust).await?;
+    ///     let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
     ///
     ///     let (mut tx, mut rx) = oneshot::channel();
     ///     let (manager, err) = future::join(
@@ -67,7 +70,7 @@ impl<S: Store> Manager<S, Linking> {
         store.clear_registration().await?;
 
         // generate a random alphanumeric 24 chars password
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let password = Alphanumeric.sample_string(&mut rng, 24);
 
         // generate a 52 bytes signaling key
@@ -158,7 +161,7 @@ impl<S: Store> Manager<S, Linking> {
 
                 let mut manager = Manager {
                     store: store.clone(),
-                    state: Registered::with_data(registration_data),
+                    state: Arc::new(Registered::with_data(registration_data)),
                 };
 
                 // Register pre-keys with the server. If this fails, this can lead to issues
